@@ -19,6 +19,8 @@ local MAX_RESULTS = 3000
 
 local active = true
 local connections = {}
+-- Extra cleanup run by close(), for state that lives outside the UI.
+local closeHooks = {}
 
 -- Kept in getgenv so hidden items stay restorable after re-executing.
 local hiddenItems = env.__FilesGameHidden or {}
@@ -2133,8 +2135,8 @@ local function getPath(inst)
     if root.Parent == game then
         return ("game:GetService(%q)"):format(root.ClassName) .. rest
     end
-    local base = ("local target\nfor _, i in getnilinstances() do\n    if i.Name == %q and i.ClassName == %q then\n        target = i\n    end\nend\n"):format(root.Name, root.ClassName)
-    return rest ~= "" and (base .. "target = target" .. rest) or base
+    -- A single expression, so callers can append .Prop = v or :Method() to it.
+    return ("(function() for _, i in getnilinstances() do if i.Name == %q and i.ClassName == %q then return i end end end)()"):format(root.Name, root.ClassName) .. rest
 end
 
 local function formatNumber(n)
@@ -3580,7 +3582,17 @@ local function hideItem(inst, mode)
         notify("Nothing to change", true)
         return
     end
-    hiddenItems[inst] = { mode = mode, list = list }
+    local entry = { mode = mode, list = list }
+    -- Not in `connections`: the entry outlives this run (kept in getgenv).
+    local okConn, conn = pcall(function()
+        return inst.Destroying:Connect(function()
+            if hiddenItems[inst] == entry then
+                hiddenItems[inst] = nil
+            end
+        end)
+    end)
+    entry.destroyConn = okConn and conn or nil
+    hiddenItems[inst] = entry
     notify(mode == "Disable" and "Disabled" or "Hidden")
 end
 
@@ -3591,8 +3603,12 @@ local function restoreItem(inst)
             item[1][item[2]] = item[3]
         end)
     end
+    if entry.destroyConn then
+        entry.destroyConn:Disconnect()
+    end
     hiddenItems[inst] = nil
-    notify(entry.mode == "Disable" and "Enabled" or "Shown")
+    local isScript = inst:IsA("BaseScript")
+    notify(entry.mode == "Disable" and (isScript and "Enabled (script restarted)" or "Enabled") or "Shown")
 end
 
 -- Explorer: virtual list; Frames only exist for visible rows.
@@ -3743,7 +3759,7 @@ end
 
 -- Search results are shown as a tree: each match under its real ancestors.
 local function flattenResults(tree)
-    local rows = { roots = tree.roots, matchCount = tree.matchCount }
+    local rows = { roots = tree.roots, matchCount = tree.matchCount, matches = tree.matches }
     local count = 0
     local function visit(node, depth)
         count += 1
@@ -3796,7 +3812,7 @@ local function buildResultTree(matches)
         end
     end
     order(roots)
-    flattenResults({ roots = roots, matchCount = #matches })
+    flattenResults({ roots = roots, matchCount = #matches, matches = matches })
 end
 
 local function toggleNode(node)
@@ -4086,11 +4102,17 @@ local function rowText(row, value)
     return text
 end
 
-refreshRow = function(row)
+-- light: periodic refresh; compares across the selection only when the first item changed.
+refreshRow = function(row, light)
     local ok, value = readValue(row)
     if not ok then
         return
     end
+    local primaryText = formatValue(value)
+    if light and primaryText == row.primaryText then
+        return
+    end
+    row.primaryText = primaryText
     local text = rowText(row, value)
     if text ~= row.lastText then
         row.lastText = text
@@ -4098,10 +4120,17 @@ refreshRow = function(row)
     end
 end
 
+-- newValue may be a function(inst) for values built per instance.
 local function applyValue(row, newValue)
     local failure
     for _, inst in ipairs(row.insts) do
-        local ok, err = pcall(row.write, inst, newValue)
+        local ok, err = pcall(function()
+            local value = newValue
+            if type(newValue) == "function" then
+                value = newValue(inst)
+            end
+            row.write(inst, value)
+        end)
         if not ok then
             failure = err
         end
@@ -4225,7 +4254,14 @@ local function textField(row, area, initialValue)
         local okRead, current = readValue(row)
         local ok, newValue = pcall(PARSERS[row.kind], text, okRead and current or nil)
         if ok and newValue ~= nil then
-            applyValue(row, newValue)
+            if row.kind == "CFrame" and #row.insts > 1 then
+                -- Each item keeps its own rotation when only a position is typed.
+                applyValue(row, function(inst)
+                    return PARSERS.CFrame(text, row.read(inst))
+                end)
+            else
+                applyValue(row, newValue)
+            end
             local okAfter, after = readValue(row)
             if okAfter then
                 paintSwatch(after)
@@ -4527,6 +4563,14 @@ buildProps = function(list)
 
     local insts = table.clone(list)
     local primary = selected or insts[1]
+    -- Rows read from insts[1]; keep it the same instance attributes/tags come from.
+    local primaryIndex = table.find(insts, primary)
+    if primaryIndex and primaryIndex > 1 then
+        table.remove(insts, primaryIndex)
+        table.insert(insts, 1, primary)
+    elseif not primaryIndex then
+        primary = insts[1]
+    end
     lblTarget.Text = #insts == 1 and (primary.Name .. "  ·  " .. primary.ClassName) or (#insts .. " items selected")
     lblTarget.TextColor3 = COLOR.text
 
@@ -4651,10 +4695,12 @@ function Query.tokenize(text)
             table.insert(tokens, { kind = "op", text = c })
             pos += 1
         else
-            local parts, quoted = {}, false
+            local parts, quoted, lead = {}, false, nil
             while pos <= n do
                 local ch = text:sub(pos, pos)
                 if ch == '"' then
+                    -- Text before the first quote, so tag:"a b" keeps its prefix.
+                    lead = lead or table.concat(parts)
                     quoted = true
                     local close = text:find('"', pos + 1, true) or (n + 1)
                     table.insert(parts, text:sub(pos + 1, close - 1))
@@ -4669,7 +4715,7 @@ function Query.tokenize(text)
             if #parts == 0 then
                 pos += 1
             else
-                table.insert(tokens, { kind = "word", text = table.concat(parts), quoted = quoted })
+                table.insert(tokens, { kind = "word", text = table.concat(parts), quoted = quoted, lead = lead })
             end
         end
     end
@@ -4880,8 +4926,9 @@ function Query.parseTerm(tokens, state)
         return propertyTerm(word, following.text, wanted)
     end
 
-    if not token.quoted then
-        if word:sub(1, 1) == "/" then
+    local quotedPrefix = token.quoted and token.lead and token.lead:match("^(%a+):$")
+    if not token.quoted or quotedPrefix then
+        if not token.quoted and word:sub(1, 1) == "/" then
             local extra = Query.parseExtra(word, tokens, state)
             if extra then
                 return extra
@@ -4912,7 +4959,7 @@ function Query.parseTerm(tokens, state)
                 end
             end
         end
-        if word:find("*", 1, true) then
+        if not token.quoted and word:find("*", 1, true) then
             return pathTerm(word)
         end
     end
@@ -4982,7 +5029,12 @@ function Query.compile(text)
     if #tokens == 0 then
         return nil
     end
-    return Query.parseOr(tokens, { pos = 1 })
+    local state = { pos = 1 }
+    local predicate = Query.parseOr(tokens, state)
+    if state.pos <= #tokens then
+        error("unexpected '" .. (tokens[state.pos].text or tokens[state.pos].kind) .. "'")
+    end
+    return predicate
 end
 
 -- Autocomplete: replaces the word being typed.
@@ -5151,7 +5203,9 @@ end
 local function runSearch(token, term)
     local okCompile, predicate = pcall(Query.compile, term)
     if not okCompile then
-        notify("Invalid search: " .. tostring(predicate), true)
+        -- Old results would look like the answer to the new query.
+        endSearch()
+        notify("Invalid search: " .. tostring(predicate):gsub("^.-:%d+: ", ""), true)
         return
     end
     if not predicate then
@@ -5295,7 +5349,32 @@ function Do.markParents(insts)
     end
 end
 
+-- Drops targets whose ancestor is also a target, so actions keep the hierarchy.
+function Do.topLevel(targets)
+    local set = {}
+    for _, inst in ipairs(targets) do
+        set[inst] = true
+    end
+    local out = {}
+    for _, inst in ipairs(targets) do
+        local parent = inst.Parent
+        local nested = false
+        while parent do
+            if set[parent] then
+                nested = true
+                break
+            end
+            parent = parent.Parent
+        end
+        if not nested then
+            table.insert(out, inst)
+        end
+    end
+    return out
+end
+
 function Do.copyItems(targets)
+    targets = Do.topLevel(targets)
     local copies = {}
     for _, inst in ipairs(targets) do
         local copy = Do.cloneOf(inst)
@@ -5308,6 +5387,7 @@ function Do.copyItems(targets)
 end
 
 function Do.cutItems(targets)
+    targets = Do.topLevel(targets)
     local moved = {}
     Do.markParents(targets)
     for _, inst in ipairs(targets) do
@@ -5324,6 +5404,7 @@ end
 
 function Do.pasteInto(parents)
     local created = {}
+    local keepCut = false
     for _, parent in ipairs(parents) do
         for i, item in ipairs(clip.items) do
             if clip.wasCut then
@@ -5333,8 +5414,15 @@ function Do.pasteInto(parents)
                     item.Parent = parent
                 end) then
                     table.insert(created, item)
+                    if spare then
+                        clip.items[i] = spare
+                    end
+                else
+                    keepCut = true
+                    if spare then
+                        spare:Destroy()
+                    end
                 end
-                clip.items[i] = spare
             else
                 local copy = Do.cloneOf(item)
                 if copy and pcall(function()
@@ -5344,7 +5432,9 @@ function Do.pasteInto(parents)
                 end
             end
         end
-        clip.wasCut = false
+        -- A failed move keeps the original cut so the next paste can place it.
+        clip.wasCut = keepCut
+        keepCut = false
         markDirty(parent)
     end
     setSelection(created)
@@ -5352,6 +5442,7 @@ function Do.pasteInto(parents)
 end
 
 function Do.duplicateItems(targets)
+    targets = Do.topLevel(targets)
     local created = {}
     for _, inst in ipairs(targets) do
         local copy = not Do.isProtected(inst) and Do.cloneOf(inst)
@@ -5393,9 +5484,27 @@ function Do.deleteItems(targets)
 end
 
 function Do.groupItems(targets)
-    local parent = targets[1].Parent
+    targets = Do.topLevel(targets)
+    local first
+    for _, inst in ipairs(targets) do
+        if not Do.isProtected(inst) and inst.Parent then
+            first = inst
+            break
+        end
+    end
+    if not first then
+        notify("Nothing to group", true)
+        return
+    end
+    local parent = first.Parent
     local model = Instance.new("Model")
-    model.Parent = parent
+    if not pcall(function()
+        model.Parent = parent
+    end) then
+        model:Destroy()
+        notify("Cannot group here", true)
+        return
+    end
     for _, inst in ipairs(targets) do
         if not Do.isProtected(inst) then
             pcall(function()
@@ -5412,16 +5521,24 @@ function Do.ungroupItems(targets)
     for _, inst in ipairs(targets) do
         if not Do.isProtected(inst) and (inst:IsA("Model") or inst:IsA("Folder")) then
             local parent = inst.Parent
+            local failed = 0
             for _, child in ipairs(inst:GetChildren()) do
                 if pcall(function()
                     child.Parent = parent
                 end) then
                     table.insert(released, child)
+                else
+                    failed += 1
                 end
             end
-            pcall(function()
-                inst:Destroy()
-            end)
+            -- Only remove the container when it is really empty.
+            if failed == 0 and #inst:GetChildren() == 0 then
+                pcall(function()
+                    inst:Destroy()
+                end)
+            else
+                notify(inst.Name .. ": " .. failed .. " children could not move; kept container", true)
+            end
             markDirty(parent)
         end
     end
@@ -5475,7 +5592,7 @@ function Do.expandAll(targets)
             return
         end
         node.expanded = true
-        if not node.children or node.stale then
+        if not node.children or node.isStale then
             loadChildren(node)
         end
         for _, child in ipairs(node.children) do
@@ -5645,6 +5762,25 @@ function Do.findReferences(target)
     local readUpvalues = getupvalues or (debug and debug.getupvalues)
     local objects = getgc(true)
     owned[objects] = true
+    -- FilesGame's own lists, so they don't show up as references.
+    for _, list in ipairs({ clip, clip.items, results or false, visibleRows or false, propRows }) do
+        if list then
+            owned[list] = true
+        end
+    end
+    for _, entry in pairs(hiddenItems) do
+        owned[entry] = true
+        owned[entry.list] = true
+        for _, item in ipairs(entry.list) do
+            owned[item] = true
+        end
+    end
+    local function isOwnShape(object)
+        -- Explorer nodes, search nodes and property rows.
+        return (rawget(object, "inst") ~= nil and (rawget(object, "depth") ~= nil or rawget(object, "isSearch") ~= nil or rawget(object, "expanded") ~= nil))
+            or rawget(object, "insts") ~= nil
+            or (rawget(object, "direction") ~= nil and rawget(object, "method") ~= nil)
+    end
 
     for i, object in ipairs(objects) do
         if i % 20000 == 0 then
@@ -5655,7 +5791,11 @@ function Do.findReferences(target)
             break
         end
         local kind = type(object)
+        local okShape, ownShape = false, false
         if kind == "table" and not owned[object] then
+            okShape, ownShape = pcall(isOwnShape, object)
+        end
+        if kind == "table" and not owned[object] and not (okShape and ownShape) then
             pcall(function()
                 for key, value in next, object do
                     if rawequal(value, target) or rawequal(key, target) then
@@ -5713,6 +5853,10 @@ function Do.fireAll(targets, className, fire)
 end
 
 function Do.matchedInstances()
+    -- Full match list, including rows hidden under collapsed nodes.
+    if results.matches then
+        return table.clone(results.matches)
+    end
     local all = {}
     for _, row in ipairs(results) do
         if row.match then
@@ -5847,9 +5991,23 @@ openActions = function(anchor)
         add("Teleport To", function() teleportTo(inst) end)
         if inst:IsA("BasePart") or inst:IsA("Model") then
             add("View Object", function()
-                workspace.CurrentCamera.CameraSubject = inst
+                local camera = workspace.CurrentCamera
+                if not Do.viewingObject then
+                    -- Restored by Reset Camera or when FilesGame closes.
+                    Do.viewingObject = true
+                    local original = camera.CameraSubject
+                    table.insert(closeHooks, function()
+                        if Do.viewingObject and workspace.CurrentCamera then
+                            local character = Players.LocalPlayer.Character
+                            local fallback = character and character:FindFirstChildOfClass("Humanoid")
+                            workspace.CurrentCamera.CameraSubject = (original and original.Parent and original) or fallback
+                        end
+                    end)
+                end
+                camera.CameraSubject = inst
             end)
             add("Reset Camera", function()
+                Do.viewingObject = false
                 local character = Players.LocalPlayer.Character
                 workspace.CurrentCamera.CameraSubject = character and character:FindFirstChildOfClass("Humanoid")
             end)
@@ -5995,7 +6153,13 @@ function Do.setClickMode(mode)
             and input.UserInputType ~= Enum.UserInputType.Touch then
             return
         end
-        if pointerOverMain or modalBackdrop.Visible then
+        -- Geometry test: MouseEnter/MouseLeave are unreliable with touch.
+        local pos = input.Position
+        local topLeft, size = main.AbsolutePosition, main.AbsoluteSize
+        local insideMain = pos.X >= topLeft.X and pos.X <= topLeft.X + size.X
+            and pos.Y >= topLeft.Y and pos.Y <= topLeft.Y + size.Y
+        local hovering = input.UserInputType == Enum.UserInputType.MouseButton1 and pointerOverMain
+        if insideMain or hovering or modalBackdrop.Visible or menuBackdrop.Visible then
             return
         end
         local target
@@ -6108,10 +6272,14 @@ do
     local Deep = {}
     Deep.MAX_HITS = 3000
     Deep.MAX_CALLS_PER_REMOTE = 40
-    Deep.captured = {}
+    Deep.MAX_CLONED_VALUES = 2000
+    -- Weak keys: destroyed remotes drop out once nothing else holds them.
+    Deep.captured = setmetatable({}, { __mode = "k" })
+    Deep.watched = setmetatable({}, { __mode = "k" })
     Deep.capturedTotal = 0
     Deep.capturing = false
 
+    -- seen.__count caps the whole payload, not just one table.
     function Deep.cloneValue(value, seen, depth)
         if type(value) ~= "table" then
             return value
@@ -6119,14 +6287,15 @@ do
         if seen[value] then
             return seen[value]
         end
-        if depth >= 8 then
+        if depth >= 8 or (seen.__count or 0) >= Deep.MAX_CLONED_VALUES then
             return {}
         end
         local copy, count = {}, 0
         seen[value] = copy
         for k, v in next, value do
             count += 1
-            if count > 400 then
+            seen.__count = (seen.__count or 0) + 1
+            if count > 400 or seen.__count > Deep.MAX_CLONED_VALUES then
                 break
             end
             copy[Deep.cloneValue(k, seen, depth + 1)] = Deep.cloneValue(v, seen, depth + 1)
@@ -6150,6 +6319,9 @@ do
 
     -- Runs inside the hook: no namecall on Instances here, or the game's call changes method.
     function Deep.remoteSink(remote, method, phase, callOrFirst, ...)
+        if not active then
+            return nil
+        end
         if phase == "start" then
             local args = table.pack(callOrFirst, ...)
             local seen = {}
@@ -6190,9 +6362,21 @@ do
         end))
     end
 
+    -- Only remotes the game already listens to: a first listener would flush
+    -- the queued events that game scripts connecting later still expect.
     function Deep.watchRemote(inst)
+        if Deep.watched[inst] or not getconnections then
+            return
+        end
         if inst:IsA("RemoteEvent") or inst:IsA("UnreliableRemoteEvent") then
-            connect(inst.OnClientEvent, function(...)
+            local ok, list = pcall(getconnections, inst.OnClientEvent)
+            if not ok or type(list) ~= "table" or #list == 0 then
+                return
+            end
+            Deep.watched[inst] = inst.OnClientEvent:Connect(function(...)
+                if not active then
+                    return
+                end
                 local args = table.pack(...)
                 local seen = {}
                 for i = 1, args.n do
@@ -6209,13 +6393,45 @@ do
         end
         Deep.capturing = true
         Deep.installHook()
-        for _, inst in ipairs(game:GetDescendants()) do
-            pcall(Deep.watchRemote, inst)
-        end
-        connect(game.DescendantAdded, function(inst)
-            pcall(Deep.watchRemote, inst)
+        -- Remotes the game connects to later are picked up by the periodic sweep.
+        task.spawn(function()
+            while active do
+                local remotes = {}
+                for _, inst in ipairs(game:GetDescendants()) do
+                    if not Deep.watched[inst] and (inst:IsA("RemoteEvent") or inst:IsA("UnreliableRemoteEvent")) then
+                        table.insert(remotes, inst)
+                    end
+                end
+                for i, inst in ipairs(remotes) do
+                    pcall(Deep.watchRemote, inst)
+                    if i % 200 == 0 then
+                        task.wait()
+                    end
+                end
+                task.wait(5)
+            end
         end)
     end
+
+    function Deep.stop()
+        if env.__FilesGameRemoteSink == Deep.remoteSink then
+            env.__FilesGameRemoteSink = nil
+        end
+        for _, c in pairs(Deep.watched) do
+            pcall(function()
+                c:Disconnect()
+            end)
+        end
+        table.clear(Deep.watched)
+        table.clear(Deep.captured)
+        if Deep.sourceCache then
+            table.clear(Deep.sourceCache)
+        end
+        if Deep.hits then
+            table.clear(Deep.hits)
+        end
+    end
+    table.insert(closeHooks, Deep.stop)
 
     function Deep.dumpValue(value)
         local lines, count, seen = {}, 0, {}
@@ -6607,7 +6823,14 @@ do
             local entry = table.remove(stack)
             local current, path = entry[1], entry[2]
             local owned = entry[3] or (onlyPlayer and Deep.tableMentionsPlayer(current))
+            -- Snapshot first: the loop yields, and the game may add keys meanwhile.
+            local keys, values = {}, {}
             for key, value in next, current do
+                table.insert(keys, key)
+                table.insert(values, value)
+            end
+            for index = 1, #keys do
+                local key, value = keys[index], values[index]
                 visited += 1
                 if visited % 4000 == 0 then
                     task.wait()
@@ -7064,7 +7287,7 @@ task.spawn(function()
         task.wait(0.5)
         if active and body.Visible then
             for _, row in ipairs(propRows) do
-                pcall(refreshRow, row)
+                pcall(refreshRow, row, true)
             end
             pcall(render)
         end
@@ -7193,6 +7416,10 @@ local function close()
     table.clear(connections)
     table.clear(propRows)
     table.clear(nodes)
+    for _, hook in ipairs(closeHooks) do
+        pcall(hook)
+    end
+    table.clear(closeHooks)
     gui:Destroy()
     env.__FilesGameClose = nil
 end
@@ -7200,18 +7427,21 @@ env.__FilesGameClose = close
 btnClose.MouseButton1Click:Connect(close)
 
 -- Drag (mouse and touch)
-local dragging, dragStartInput, dragStartPos
+local dragging, dragStartInput, dragStartPos, dragInput
 
 top.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
         dragging, dragStartInput, dragStartPos = true, input.Position, main.Position
+        -- Only the finger that started the drag moves the window.
+        dragInput = input.UserInputType == Enum.UserInputType.Touch and input or nil
     end
 end)
 
 connect(UIS.InputChanged, function(input)
-    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch) then
+    local isMouse = input.UserInputType == Enum.UserInputType.MouseMovement and dragInput == nil
+    local isSameTouch = input.UserInputType == Enum.UserInputType.Touch and input == dragInput
+    if dragging and (isMouse or isSameTouch) then
         local d = input.Position - dragStartInput
         main.Position = UDim2.new(
             dragStartPos.X.Scale, dragStartPos.X.Offset + d.X,
@@ -7222,8 +7452,9 @@ end)
 
 connect(UIS.InputEnded, function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
+        or (input.UserInputType == Enum.UserInputType.Touch and (dragInput == nil or input == dragInput)) then
         dragging = false
+        dragInput = nil
     end
 end)
 
