@@ -51,6 +51,7 @@ local settings = {
     showAttributes = true,
     showTags = true,
     selectionBoxes = true,
+    forceCursor = true,
 }
 pcall(function()
     if isfile(SETTINGS_FILE) then
@@ -6214,6 +6215,7 @@ btnTools.MouseButton1Click:Connect(function()
         { text = state("Show Hidden", settings.showHidden), action = function() Do.toggleSetting("showHidden") end },
         { text = state("Show Attributes", settings.showAttributes), action = function() Do.toggleSetting("showAttributes") end },
         { text = state("Show Tags", settings.showTags), action = function() Do.toggleSetting("showTags") end },
+        { text = state("Force mouse cursor", settings.forceCursor), action = function() Do.toggleSetting("forceCursor") end },
     })
 end)
 
@@ -7470,6 +7472,89 @@ end)
 connect(main.MouseLeave, function()
     pointerOverMain = false
 end)
+
+-- Mouse cursor over FilesGame: some games hide the system cursor and draw their
+-- own in PlayerGui, which ends up under this UI. While the pointer is over a
+-- FilesGame window the system cursor is forced on (it always draws above every
+-- GUI), and the game's values are put back when the pointer leaves.
+do
+    local RunService = game:GetService("RunService")
+    local GuiService = game:GetService("GuiService")
+    local BIND_NAME = "FilesGameCursor"
+    local saved -- { iconEnabled, icon } while forcing
+
+    -- Modal button: frees a mouse locked to the center (first person / shift lock).
+    local modalButton = create("TextButton", {
+        Name = "CursorUnlock",
+        Size = UDim2.fromOffset(0, 0),
+        BackgroundTransparency = 1,
+        Text = "",
+        Modal = true,
+    }, main)
+
+    local function pointerOverUi()
+        if pointerOverMain then
+            return true
+        end
+        local okInset, inset = pcall(function()
+            return GuiService:GetGuiInset()
+        end)
+        local mouse = UIS:GetMouseLocation() - (okInset and inset or Vector2.zero)
+        for _, child in ipairs(gui:GetChildren()) do
+            if child:IsA("GuiObject") and child.Visible and child ~= guiOutline then
+                local topLeft, size = child.AbsolutePosition, child.AbsoluteSize
+                if mouse.X >= topLeft.X and mouse.X <= topLeft.X + size.X
+                    and mouse.Y >= topLeft.Y and mouse.Y <= topLeft.Y + size.Y then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function release()
+        if saved then
+            local values = saved
+            saved = nil
+            pcall(function()
+                UIS.MouseIcon = values.icon
+                UIS.MouseIconEnabled = values.iconEnabled
+            end)
+        end
+    end
+
+    local function step()
+        local open = active and settings.forceCursor and gui.Enabled and main.Visible and not minimized
+        modalButton.Visible = open == true
+        if not open or not UIS.MouseEnabled or not pointerOverUi() then
+            release()
+            return
+        end
+        if not saved then
+            saved = { iconEnabled = UIS.MouseIconEnabled, icon = UIS.MouseIcon }
+        end
+        -- Set every frame, after game render-step code, in case the game keeps hiding it.
+        if not UIS.MouseIconEnabled then
+            UIS.MouseIconEnabled = true
+        end
+        if UIS.MouseIcon ~= "" then
+            UIS.MouseIcon = ""
+        end
+    end
+
+    pcall(function()
+        RunService:UnbindFromRenderStep(BIND_NAME)
+    end)
+    RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Last.Value + 1, function()
+        pcall(step)
+    end)
+    table.insert(closeHooks, function()
+        pcall(function()
+            RunService:UnbindFromRenderStep(BIND_NAME)
+        end)
+        release()
+    end)
+end
 
 -- Follows the selected GuiObject with an outline.
 task.spawn(function()
